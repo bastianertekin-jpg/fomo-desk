@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Desk">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Desk</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="locked" class="locked hidden">
+  <div class="lock-card">
+    <div class="lock-icon">🔒</div>
+    <h1>Desk locked</h1>
+    <p>Open this app with your private link.</p>
+  </div>
+</div>
+
+<main id="app" class="hidden">
+  <header class="topbar">
+    <span class="badge paper">PAPER</span>
+    <span id="paused" class="badge warn hidden">PAUSED</span>
+    <span id="stale" class="badge stale hidden">STALE</span>
+    <span class="spacer"></span>
+    <span id="updated" class="muted small"></span>
+  </header>
+
+  <section id="tab-home" class="tab">
+    <h1 class="large-title">Home</h1>
+    <div class="hero">
+      <div class="muted small">Paper equity</div>
+      <div id="equity" class="equity">—</div>
+      <div id="equity-usd" class="muted"></div>
+      <div id="pnl" class="pnl"></div>
+    </div>
+    <div class="card chart-card">
+      <canvas id="equity-chart" height="180"></canvas>
+      <div class="seg" id="range">
+        <button data-r="3600">1H</button><button data-r="86400" class="on">1D</button><button data-r="604800">1W</button><button data-r="0">All</button>
+      </div>
+    </div>
+    <h2 class="section">Positions</h2>
+    <div id="positions" class="list"></div>
+    <h2 class="section">Watchlist</h2>
+    <div id="coins" class="list"></div>
+  </section>
+
+  <section id="tab-agents" class="tab hidden">
+    <h1 class="large-title">Agents</h1>
+    <div id="agents" class="list"></div>
+  </section>
+
+  <section id="tab-activity" class="tab hidden">
+    <h1 class="large-title">Activity</h1>
+    <div id="activity" class="list"></div>
+  </section>
+
+  <section id="tab-account" class="tab hidden">
+    <h1 class="large-title">Account</h1>
+    <div class="list" id="account"></div>
+    <p class="footnote">Plan B: static hosting, refreshes every 15 s. Notifications: Telegram only — web push is not available on Plan B.</p>
+    <div class="list"><button id="signout" class="row danger">Forget this device</button></div>
+  </section>
+
+  <div id="sheet" class="sheet hidden">
+    <div class="sheet-card">
+      <div class="grabber"></div>
+      <div class="sheet-head"><h2 id="sheet-title">Coin</h2><button id="sheet-close" class="link">Done</button></div>
+      <canvas id="coin-chart" height="160"></canvas>
+      <div id="sheet-body" class="list"></div>
+      <a id="sheet-fomo" class="cta" target="_blank" rel="noopener noreferrer">Open in FOMO</a>
+    </div>
+  </div>
+
+  <nav class="tabbar">
+    <button data-tab="home" class="on"><span class="ti">⌂</span>Home</button>
+    <button data-tab="agents"><span class="ti">◎</span>Agents</button>
+    <button data-tab="activity"><span class="ti">≡</span>Activity</button>
+    <button data-tab="account"><span class="ti">◉</span>Account</button>
+  </nav>
+</main>
+<script src="chart.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
