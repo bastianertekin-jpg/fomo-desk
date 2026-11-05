@@ -89,7 +89,7 @@
   // ---------------------------------------------------------------- error row
   function renderOffline() {
     const age = S.state ? Date.now() / 1000 - S.state.generated_at : 0;
-    const stale = S.state && age > 90;
+    const stale = S.state && age > 600;
     const show = S.failing || stale;
     const n = Math.max(0, Math.ceil(((S.failing ? S.retryAt : nextPollAt) - Date.now()) / 1000));
     const last = S.state ? hhmm(S.state.generated_at) : "never";
