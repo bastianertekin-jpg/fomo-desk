@@ -1,5 +1,8 @@
 /* app.js — STEP 8 iPhone app, Plan B client.
-   Opens as {URL}#d={DATA_PATH}&t={APP_TOKEN}; d+t go to localStorage and the hash is stripped from the URL bar.
+   Opens as {URL}#d={DATA_PATH}&t={APP_TOKEN}; d+t go to localStorage + same-origin cookies, then the hash is stripped.
+   Cookies (SameSite=Lax, Secure) survive iOS Home Screen / standalone when Safari localStorage is partitioned.
+   Boot reads hash → query → localStorage → cookie; re-mirrors into both stores; rewrites manifest start_url
+   so a later Add to Home Screen opens with ?d=&t= even without the hash.
    Polls ./d/{DATA_PATH}/*.json every 15 s (no SSE, no POST, no web push registration).
    Soft gate: state.gate === sha256("fomo-desk-gate:" + t).
    Every FOMO link comes pre-built in the JSON (server links.py) — the app never builds one. */
@@ -13,12 +16,54 @@
   const $$ = s => [...document.querySelectorAll(s)];
   const reduced = () => window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // ---------------------------------------------------------------- credentials (hash -> localStorage, strip hash)
+  // ---------------------------------------------------------------- credentials (hash -> localStorage + cookie, strip hash)
+  // iOS standalone often launches manifest start_url without the private hash and may partition
+  // localStorage from Safari; same-origin cookies are shared across Safari ↔ Home Screen.
+  function cookiePath() {
+    let p = location.pathname || "/";
+    if (!p.endsWith("/")) p = p.replace(/\/[^/]*$/, "/") || "/";
+    return p;
+  }
+  function readCookie(n) {
+    const m = document.cookie.match(new RegExp("(?:^|; )" + n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+  function writeCred(n, v) {
+    if (!v) return;
+    try { localStorage.setItem(n, v); } catch (e) {}
+    document.cookie = n + "=" + encodeURIComponent(v) + "; Path=" + cookiePath() + "; Max-Age=31536000; SameSite=Lax; Secure";
+  }
+  function clearCred(n) {
+    try { localStorage.removeItem(n); } catch (e) {}
+    document.cookie = n + "=; Path=" + cookiePath() + "; Max-Age=0; SameSite=Lax; Secure";
+  }
+  function refreshManifest(d, t) {
+    const link = document.querySelector('link[rel="manifest"]');
+    if (!link || !d) return;
+    const q = new URLSearchParams();
+    q.set("d", d);
+    if (t) q.set("t", t);
+    const apply = m => {
+      m.start_url = "./?" + q.toString();
+      m.scope = "./";
+      const blob = new Blob([JSON.stringify(m)], { type: "application/json" });
+      link.href = URL.createObjectURL(blob);
+    };
+    fetch("manifest.json", { cache: "no-store" }).then(r => r.ok ? r.json() : null).then(m => { if (m) apply(m); }).catch(() => {});
+  }
   const hp = new URLSearchParams(location.hash.replace(/^#/, ""));
-  if (hp.get("d")) localStorage.setItem(LS_D, hp.get("d"));
-  if (hp.get("t")) localStorage.setItem(LS_T, hp.get("t"));
+  const qp = new URLSearchParams(location.search);
+  const dIn = hp.get("d") || qp.get("d") || "";
+  const tIn = hp.get("t") || qp.get("t") || "";
+  if (dIn) writeCred(LS_D, dIn);
+  if (tIn) writeCred(LS_T, tIn);
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-  const D = localStorage.getItem(LS_D), T = localStorage.getItem(LS_T);
+  function readLS(n) { try { return localStorage.getItem(n) || ""; } catch (e) { return ""; } }
+  let D = dIn || readLS(LS_D) || readCookie(LS_D) || "";
+  let T = tIn || readLS(LS_T) || readCookie(LS_T) || "";
+  if (D) writeCred(LS_D, D);
+  if (T) writeCred(LS_T, T);
+  if (D) refreshManifest(D, T);
   function lock() { $("#app").classList.add("hidden"); $("#locked").classList.remove("hidden"); }
   if (!D || !/^[A-Za-z0-9_-]{16,128}$/.test(D)) return lock();
 
@@ -538,7 +583,7 @@
     if (e.target.closest("[data-ro]") || e.target.closest("[data-mode]")) return toast("Plan B: read-only here. Settings change via Telegram.");
     if (e.target.closest("#audit-toggle")) return toast("Plan B: read-only. Turning it off asks twice (Plan A).");
     if (e.target.closest("#test-push")) return toast("Test pushes come from the Telegram bot");
-    if (e.target.closest("#signout")) { localStorage.removeItem(LS_D); localStorage.removeItem(LS_T); location.reload(); return; }
+    if (e.target.closest("#signout")) { clearCred(LS_D); clearCred(LS_T); location.reload(); return; }
     const inv = e.target.closest("#invite");
     if (inv) {
       const url = inv.dataset.url;
