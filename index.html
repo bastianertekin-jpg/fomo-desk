@@ -16,75 +16,96 @@
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
+<span id="paper-flag" class="pill paper paper-flag hidden" aria-label="PAPER mode">PAPER</span>
 <div id="locked" class="locked hidden">
-  <div class="lock-card">
-    <div class="lock-icon">🔒</div>
+  <div>
     <h1>Desk locked</h1>
     <p>Open this app with your private link.</p>
   </div>
 </div>
 
-<main id="app" class="hidden">
-  <header class="topbar">
-    <span class="badge paper">PAPER</span>
-    <span id="paused" class="badge warn hidden">PAUSED</span>
-    <span id="stale" class="badge stale hidden">STALE</span>
-    <span class="spacer"></span>
-    <span id="updated" class="muted small"></span>
-  </header>
-
-  <section id="tab-home" class="tab">
-    <h1 class="large-title">Home</h1>
+<main id="app">
+  <!-- HOME -->
+  <section id="view-home" class="view" data-tab="home">
+    <header class="nav">
+      <button class="icon-btn" id="avatar" aria-label="Account"><span class="avatar" id="avatar-letter">G</span></button>
+      <button class="bot-title" id="bot-title" aria-label="Agents">Grok Bot <span class="chev">›</span></button>
+      <span class="grow"></span>
+      <button class="icon-btn" id="search-btn" aria-label="Search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg></button>
+      <button class="icon-btn" id="bell" aria-label="Notifications"><svg viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg><span id="bell-dot" class="bell-dot hidden"></span></button>
+    </header>
+    <div class="offline hidden"></div>
     <div class="hero">
-      <div class="muted small">Paper equity</div>
-      <div id="equity" class="equity">—</div>
-      <div id="equity-usd" class="muted"></div>
-      <div id="pnl" class="pnl"></div>
-    </div>
-    <div class="card chart-card">
-      <canvas id="equity-chart" height="180"></canvas>
-      <div class="seg" id="range">
-        <button data-r="3600">1H</button><button data-r="86400" class="on">1D</button><button data-r="604800">1W</button><button data-r="0">All</button>
+      <div class="bal-row">
+        <div id="balance" class="balance"><span class="sk" style="width:62vw;height:80px;display:block"></span></div>
+        <span id="paper-badge" class="pill paper hidden">PAPER</span>
       </div>
+      <div class="today" id="today"><span class="sk sk-line" style="width:150px"></span></div>
     </div>
-    <h2 class="section">Positions</h2>
-    <div id="positions" class="list"></div>
-    <h2 class="section">Watchlist</h2>
-    <div id="coins" class="list"></div>
-  </section>
-
-  <section id="tab-agents" class="tab hidden">
-    <h1 class="large-title">Agents</h1>
-    <div id="agents" class="list"></div>
-  </section>
-
-  <section id="tab-activity" class="tab hidden">
-    <h1 class="large-title">Activity</h1>
-    <div id="activity" class="list"></div>
-  </section>
-
-  <section id="tab-account" class="tab hidden">
-    <h1 class="large-title">Account</h1>
-    <div class="list" id="account"></div>
-    <p class="footnote">Plan B: static hosting, refreshes every 15 s. Notifications: Telegram only — web push is not available on Plan B.</p>
-    <div class="list"><button id="signout" class="row danger">Forget this device</button></div>
-  </section>
-
-  <div id="sheet" class="sheet hidden">
-    <div class="sheet-card">
-      <div class="grabber"></div>
-      <div class="sheet-head"><h2 id="sheet-title">Coin</h2><button id="sheet-close" class="link">Done</button></div>
-      <canvas id="coin-chart" height="160"></canvas>
-      <div id="sheet-body" class="list"></div>
-      <a id="sheet-fomo" class="cta" target="_blank" rel="noopener noreferrer">Open in FOMO</a>
+    <div class="chart-wrap">
+      <canvas id="home-chart"></canvas>
+      <div id="chart-empty" class="chart-empty hidden"></div>
     </div>
+    <div class="ranges" id="ranges">
+      <button data-r="LIVE" class="on">LIVE</button><button data-r="1H">1H</button><button data-r="4H">4H</button><button data-r="1D">1D</button><button data-r="1W">1W</button><button data-r="ALL">ALL</button>
+    </div>
+    <div class="section-h"><h2 id="agents-h">Agents</h2></div>
+    <div class="carousel" id="carousel">
+      <div class="acard sk"></div><div class="acard sk"></div>
+    </div>
+    <div class="section-h"><h2>Activity</h2><button class="see" id="see-all">See all</button></div>
+    <div class="list" id="home-activity"><div class="row"><div class="m"><div class="sk sk-line"></div><div class="sk sk-line" style="width:50%"></div></div></div></div>
+  </section>
+
+  <!-- AGENTS -->
+  <section id="view-agents" class="view hidden" data-tab="agents">
+    <header class="nav"><span class="title">Agents</span></header>
+    <div class="offline hidden"></div>
+    <div id="agents-list"><div class="pad"><div class="acard sk"></div></div></div>
+  </section>
+
+  <!-- ACTIVITY -->
+  <section id="view-activity" class="view hidden" data-tab="activity">
+    <header class="nav"><span class="title">Activity</span></header>
+    <div class="offline hidden"></div>
+    <div class="list" id="activity-list"><div class="row"><div class="m"><div class="sk sk-line"></div><div class="sk sk-line" style="width:50%"></div></div></div></div>
+    <div class="list hidden" id="activity-more" style="margin-top:12px"><button class="row center" id="load-more">Load more</button></div>
+  </section>
+
+  <!-- ACCOUNT -->
+  <section id="view-account" class="view hidden" data-tab="account">
+    <header class="nav"><span class="title">Account</span></header>
+    <div class="offline hidden"></div>
+    <div id="account-body"><div class="list"><div class="row"><div class="m"><div class="sk sk-line"></div></div></div></div></div>
+  </section>
+
+  <!-- COIN SCREEN -->
+  <section id="screen-coin" class="screen" aria-hidden="true">
+    <header class="nav"><button class="back" data-back><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>Back</button><span class="grow"></span></header>
+    <div class="offline hidden"></div>
+    <div id="coin-body"></div>
+  </section>
+
+  <!-- AUDITOR SCREEN -->
+  <section id="screen-audit" class="screen" aria-hidden="true">
+    <header class="nav"><button class="back" data-back><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>Back</button><span class="title">Auditor</span><span style="width:76px"></span></header>
+    <div class="offline hidden"></div>
+    <div id="audit-body"></div>
+  </section>
+
+  <!-- SEARCH -->
+  <div id="search" class="search hidden">
+    <div class="search-bar"><input id="search-input" type="search" placeholder="Name, symbol or mint" autocomplete="off" autocapitalize="off" spellcheck="false"><button id="search-cancel">Cancel</button></div>
+    <div class="list" id="search-results"></div>
   </div>
 
-  <nav class="tabbar">
-    <button data-tab="home" class="on"><span class="ti">⌂</span>Home</button>
-    <button data-tab="agents"><span class="ti">◎</span>Agents</button>
-    <button data-tab="activity"><span class="ti">≡</span>Activity</button>
-    <button data-tab="account"><span class="ti">◉</span>Account</button>
+  <div id="toast" class="toast hidden"></div>
+
+  <nav class="tabbar" id="tabbar">
+    <button data-tab="home" class="on"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9h-5v-6H9v6H4z"/></svg>Home</button>
+    <button data-tab="agents"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c0-3.9 3.1-6 7-6s7 2.1 7 6"/></svg>Agents</button>
+    <button data-tab="activity"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>Activity</button>
+    <button data-tab="account"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="10" r="3"/><path d="M6.5 18.5c1.4-2 3.3-3 5.5-3s4.1 1 5.5 3"/></svg>Account</button>
   </nav>
 </main>
 <script src="chart.js"></script>
