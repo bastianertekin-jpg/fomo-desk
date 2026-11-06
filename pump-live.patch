@@ -1,0 +1,1596 @@
+--- a/commands.py
++++ b/commands.py
+@@ -31,6 +31,11 @@
+ PUSHES_KEY = "_pushes"          # tonight's Buy pushes as sent: {mint: {"text", "ts"}} (Telegram notifier writes it)
+ REPORT_KEY = "_last_report_url"  # STEP 12 night-report writes the morning Page link here
+ LIVE_CONFIRM_S = 120
++TELEGRAM_LIVE_REFUSAL = (
++    "Telegram cannot activate LIVE. Desk stays PAPER. "
++    "LIVE is typed outside Telegram, and only after a full PAPER night, "
++    "reviewed results, approved limits, and an approved wallet."
++)
+ NEG_DISPLAY = ("risk.stop_pct",)  # shown as "-6%"
+ 
+ HELP = """Talk to the desk (/command or plain text). X = name, symbol or mint.
+@@ -325,6 +330,11 @@
+         t = (text or "").strip()
+         if not t:
+             return []
++        if self.who == "telegram":
++            head = t.lstrip("/").split()[0].split("@")[0]
++            if head.upper() == "LIVE":
++                self.ctx.state.pop("live_pending", None)
++                return [Reply(TELEGRAM_LIVE_REFUSAL)]
+         pending = self.ctx.state.get("live_pending")
+         if t == "LIVE" and pending and time.time() - pending <= LIVE_CONFIRM_S:
+             return self.confirm_live()
+@@ -546,6 +556,9 @@
+         return [Reply("LIVE -> PAPER. New pushes start with \"PAPER · \"." + self.ticket_note(tag="PAPER · "))]
+ 
+     def to_live(self, _=""):
++        if self.who == "telegram":
++            self.ctx.state.pop("live_pending", None)
++            return [Reply(TELEGRAM_LIVE_REFUSAL)]
+         if not self.paper:
+             return [Reply("Already LIVE.")]
+         self.ctx.state["live_pending"] = time.time()
+@@ -554,6 +567,8 @@
+ 
+     def confirm_live(self):
+         self.ctx.state.pop("live_pending", None)
++        if self.who == "telegram":
++            return [Reply(TELEGRAM_LIVE_REFUSAL)]
+         night = paper_night_status(self.db, self.cfg)
+         if not night["done"]:
+             return [Reply("Not yet: LIVE needs at least 1 full PAPER night in the db. Desk stays PAPER."
+--- a/main.py
++++ b/main.py
+@@ -22,6 +22,7 @@
+ from agents.auditor import Auditor
+ from agents.common import Ctx
+ from agents.executor import Executor
++from agents.pump_live import PumpLive
+ from agents.risk import Risk
+ from agents.scanner import Scanner
+ from api import PlanBWriter
+@@ -194,6 +195,8 @@
+     registry: dict = {}
+     for a in workers:
+         _start(registry, a.name, a)
++    # Disabled. Reconciles its own file only; it is not a pipeline agent and it does not heartbeat.
++    _start(registry, "pump_live", PumpLive(ctx))
+     _start(registry, "publisher", writer)
+     if not args.no_telegram and not args.smoke:
+         _start(registry, "telegram", Telegram(ctx))
+--- a/tests/test_paper_live.py
++++ b/tests/test_paper_live.py
+@@ -210,7 +210,7 @@
+ def test_live_switch_refuses_without_night(tmp_path):
+     ctx = make_ctx(tmp_path, live_stack=1000)
+     Executor(ctx)
+-    cmds = Commands(ctx)
++    cmds = Commands(ctx, who="cli")
+     assert "Type LIVE (capitals) within 2 min to confirm" in run(cmds, "live")[0].text
+     t = run(cmds, "LIVE")[0].text
+     assert t.startswith("Not yet: LIVE needs at least 1 full PAPER night in the db. Desk stays PAPER.")
+@@ -221,7 +221,11 @@
+     ctx = make_ctx(tmp_path, live_stack=1000)
+     Executor(ctx)
+     full_night(ctx.db)
+-    cmds = Commands(ctx)
++    blocked = Commands(ctx)  # telegram cannot arm the manual FOMO switch either
++    assert run(blocked, "live")[0].text.startswith("Telegram cannot activate LIVE")
++    assert run(blocked, "LIVE")[0].text.startswith("Telegram cannot activate LIVE")
++    assert ctx.cfg["desk"]["mode"] == "PAPER"
++    cmds = Commands(ctx, who="cli")
+     assert run(cmds, "LIVE")[0].text.startswith("Switching to LIVE")  # no prompt pending -> just asks
+     assert ctx.cfg["desk"]["mode"] == "PAPER"
+     run(cmds, "live")
+@@ -242,7 +246,7 @@
+     ctx = make_ctx(tmp_path, live_stack=1000)
+     Executor(ctx)
+     full_night(ctx.db)
+-    cmds = Commands(ctx)
++    cmds = Commands(ctx, who="cli")
+     run(cmds, "live")
+     ctx.state["live_pending"] -= 121
+     assert run(cmds, "LIVE")[0].text.startswith("Switching to LIVE") and ctx.cfg["desk"]["mode"] == "PAPER"
+@@ -252,7 +256,7 @@
+     ctx = make_ctx(tmp_path)
+     Executor(ctx)
+     full_night(ctx.db)
+-    cmds = Commands(ctx)
++    cmds = Commands(ctx, who="cli")
+     run(cmds, "live")
+     assert run(cmds, "LIVE")[0].text.startswith("Set your LIVE stack first") and ctx.cfg["desk"]["mode"] == "PAPER"
+ 
+--- a/tests/test_telegram_cmds.py
++++ b/tests/test_telegram_cmds.py
+@@ -203,11 +203,12 @@
+ 
+ def test_live_needs_typed_LIVE_and_a_paper_night(tmp_path):
+     ctx, cmds = setup(tmp_path)
+-    assert "Type LIVE" in run(cmds, "live")[0].text
+-    t = run(cmds, "LIVE")[0].text
+-    assert t.startswith("Not yet: LIVE needs at least 1 full PAPER night in the db. Desk stays PAPER.")
++    assert run(cmds, "live")[0].text.startswith("Telegram cannot activate LIVE")
++    assert run(cmds, "LIVE")[0].text.startswith("Telegram cannot activate LIVE")
++    assert ctx.cfg["desk"]["mode"] == "PAPER"
++    ctx.state["live_pending"] = 1  # a stale prompt must not confirm from Telegram
++    assert run(cmds, "LIVE")[0].text.startswith("Telegram cannot activate LIVE")
+     assert ctx.cfg["desk"]["mode"] == "PAPER"
+-    assert "Type LIVE" in run(cmds, "LIVE")[0].text  # no pending confirm -> asks again
+     assert run(cmds, "paper")[0].text == "Already PAPER."
+ 
+ 
+--- a/pump_curve.py
++++ b/pump_curve.py
+@@ -0,0 +1,525 @@
++"""Official pump.fun instruction construction. Nothing here is sent.
++
++Curve trades follow the public pump IDL and @pump-fun/pump-sdk 4.1.0:
++buy_v3 / sell_v3 on 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P.
++Migrated pools follow pump_amm buy_v2 / sell_v2 on
++pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA, and only when the caller
++explicitly enables that adapter for a migrated mint. Quotes stay inside the
++curve or the supplied vaults. Cashback, mayhem, quote chains, non-SOL quotes,
++and a buy that would finish the curve are refused. Fee rates and the buyback
++recipient are arguments; this module does not invent them and does not call
++the network.
++"""
++
++from __future__ import annotations
++
++import struct
++from dataclasses import dataclass
++
++from agents.common import (
++    PUMP_PROGRAM,
++    TOKEN_2022_PROGRAM,
++    TOKEN_PROGRAM,
++    b58decode,
++    b58encode,
++    find_program_address,
++)
++
++ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
++SYSTEM_PROGRAM = "11111111111111111111111111111111"
++WSOL_MINT = "So11111111111111111111111111111111111111112"
++
++PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
++FEE_PROGRAM = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
++FEE_CONFIG_SEED = b"fee_config"
++
++# sha256("global:<name>")[:8] and sha256("account:<name>")[:8], checked
++# against the public IDL.
++BUY_V3 = bytes([7, 5, 29, 196, 245, 23, 101, 80])
++SELL_V3 = bytes([28, 146, 222, 119, 38, 196, 105, 213])
++BUY_V2 = bytes([184, 23, 238, 97, 103, 197, 211, 61])
++SELL_V2 = bytes([93, 246, 130, 60, 231, 233, 64, 178])
++BONDING_CURVE_DISC = bytes([23, 183, 248, 55, 96, 216, 172, 96])
++POOL_DISC = bytes([241, 154, 109, 4, 17, 177, 109, 188])
++
++BONDING_CURVE_SIZE = 166
++COMPLETE_OFFSET = 48
++ZERO = "11111111111111111111111111111111"
++
++# Named gaps. None of these are filled in by guessing.
++GAPS = (
++    "pumpportal_new_token_feed_is_not_a_source",
++    "buy_v3_refuses_cashback",
++    "mayhem_curves_refused",
++    "quote_chains_refused",
++    "non_sol_quote_refused",
++    "curve_completing_buy_refused",
++    "pumpswap_off_unless_explicit",
++    "fee_bps_and_buyback_recipient_required",
++    "no_network_and_no_signer",
++)
++
++
++class FailClosed(Exception):
++    def __init__(self, reason: str):
++        super().__init__(reason)
++        self.reason = reason
++
++
++@dataclass
++class Curve:
++    virtual_token: int
++    virtual_quote: int
++    real_token: int
++    real_quote: int
++    supply: int
++    complete: bool
++    creator: str
++    mayhem: bool
++    cashback: bool
++    quote_mint: str
++    creator_fee_bps: int
++    holder_reward: bool
++    depth: int
++    raw_len: int = BONDING_CURVE_SIZE
++
++
++@dataclass
++class MintView:
++    mint: str
++    program: str
++    decimals: int
++    mint_authority: str | None
++    freeze_authority: str | None
++
++
++@dataclass
++class Quote:
++    tokens: int
++    net_atoms: int
++    fee_atoms: int
++    limit_atoms: int
++    impact_bps: int
++
++
++@dataclass
++class Built:
++    venue: str
++    side: str
++    data: bytes
++    accounts: list[dict]
++    message: bytes
++    quote: Quote
++
++
++def _u64(n: int) -> bytes:
++    if n < 0 or n > 2**64 - 1:
++        raise FailClosed("u64_out_of_range")
++    return struct.pack("<Q", n)
++
++
++def _i128(n: int) -> bytes:
++    if n < -(2**127) or n > 2**127 - 1:
++        raise FailClosed("i128_out_of_range")
++    return int(n).to_bytes(16, "little", signed=True)
++
++
++def ceil_fee(amount: int, bps: int) -> int:
++    if amount < 0 or bps < 0 or bps > 10_000:
++        raise FailClosed("fee_bps")
++    return (amount * bps + 9_999) // 10_000
++
++
++def _pda(program: str, *seeds: bytes) -> str:
++    return find_program_address(list(seeds), program)
++
++
++def bonding_curve_pda(mint: str) -> str:
++    return _pda(PUMP_PROGRAM, b"bonding-curve", b58decode(mint))
++
++
++def event_authority(program: str) -> str:
++    return _pda(program, b"__event_authority")
++
++
++def global_pda() -> str:
++    return _pda(PUMP_PROGRAM, b"global")
++
++
++def amm_global_pda() -> str:
++    return _pda(PUMP_AMM_PROGRAM, b"global_config")
++
++
++def user_volume_pda(user: str) -> str:
++    return _pda(PUMP_PROGRAM, b"user_volume_accumulator", b58decode(user))
++
++
++def amm_user_volume_pda(user: str) -> str:
++    return _pda(PUMP_AMM_PROGRAM, b"user_volume_accumulator", b58decode(user))
++
++
++def fee_config_pda(program: str) -> str:
++    return _pda(FEE_PROGRAM, FEE_CONFIG_SEED, b58decode(program))
++
++
++def associated_token(owner: str, mint: str, token_program: str) -> str:
++    return _pda(
++        ASSOCIATED_TOKEN_PROGRAM,
++        b58decode(owner),
++        b58decode(token_program),
++        b58decode(mint),
++    )
++
++
++def sol_quote(mint: str) -> bool:
++    return mint in (ZERO, WSOL_MINT)
++
++
++def normalize_quote(mint: str) -> str:
++    if not sol_quote(mint):
++        raise FailClosed("non_sol_quote")
++    return WSOL_MINT
++
++
++def encode_curve(c: Curve) -> bytes:
++    raw = bytearray(BONDING_CURVE_SIZE)
++    raw[0:8] = BONDING_CURVE_DISC
++    struct.pack_into("<QQQQQ", raw, 8, c.virtual_token, c.virtual_quote,
++                     c.real_token, c.real_quote, c.supply)
++    raw[48] = 1 if c.complete else 0
++    raw[49:81] = b58decode(c.creator)
++    raw[81] = 1 if c.mayhem else 0
++    raw[82] = 1 if c.cashback else 0
++    raw[83:115] = b58decode(c.quote_mint)
++    struct.pack_into("<Q", raw, 115, c.creator_fee_bps)
++    raw[124] = 1 if c.holder_reward else 0
++    raw[141] = c.depth
++    return bytes(raw)
++
++
++def decode_curve(raw: bytes) -> Curve:
++    if len(raw) < COMPLETE_OFFSET + 1 or raw[:8] != BONDING_CURVE_DISC:
++        raise FailClosed("not_a_bonding_curve")
++    if len(raw) > BONDING_CURVE_SIZE and any(raw[BONDING_CURVE_SIZE:]):
++        raise FailClosed("unknown_curve_tail")
++    buf = raw.ljust(BONDING_CURVE_SIZE, b"\x00")
++    vt, vq, rt, rq, supply = struct.unpack_from("<QQQQQ", buf, 8)
++    return Curve(
++        virtual_token=vt, virtual_quote=vq, real_token=rt, real_quote=rq,
++        supply=supply, complete=bool(buf[48]),
++        creator=b58encode(buf[49:81]), mayhem=bool(buf[81]),
++        cashback=bool(buf[82]), quote_mint=b58encode(buf[83:115]),
++        creator_fee_bps=struct.unpack_from("<Q", buf, 115)[0],
++        holder_reward=bool(buf[124]), depth=buf[141], raw_len=len(raw),
++    )
++
++
++def classify(curve: Curve, mint: MintView) -> str:
++    """Structural reject. A pass is still not tradable: execution stays off."""
++    if mint.mint_authority or mint.freeze_authority:
++        raise FailClosed("authority_set")
++    if mint.program not in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
++        raise FailClosed("unknown_token_program")
++    if mint.decimals < 0 or mint.decimals > 9:
++        raise FailClosed("decimals")
++    if curve.complete:
++        raise FailClosed("curve_complete")
++    if curve.mayhem:
++        raise FailClosed("mayhem")
++    if curve.cashback:
++        raise FailClosed("cashback")
++    if curve.depth != 0:
++        raise FailClosed("quote_chain")
++    if curve.virtual_token <= 0 or curve.virtual_quote <= 0 or curve.real_token <= 0:
++        raise FailClosed("empty_reserves")
++    normalize_quote(curve.quote_mint)
++    return "bonding_curve"
++
++
++def discovery_request() -> dict:
++    """getProgramAccounts body. The running desk does not send it."""
++    return {
++        "method": "getProgramAccounts",
++        "program": PUMP_PROGRAM,
++        "sent": False,
++        "source": "pump_program",
++        "unsupported": ["pumpportal"],
++        "filters": [
++            {"memcmp": {"offset": 0, "bytes": b58encode(BONDING_CURVE_DISC)}},
++            {"memcmp": {"offset": COMPLETE_OFFSET, "bytes": b58encode(bytes([0]))}},
++        ],
++    }
++
++
++def _rates(curve: Curve, protocol_bps: int | None, creator_bps: int | None) -> tuple[int, int]:
++    """Caller passes the already chosen schedule. A nonzero on-curve creator
++    rate that disagrees with it is refused: the live gate that picks between
++    them is not decoded here."""
++    if protocol_bps is None or creator_bps is None:
++        raise FailClosed("fee_bps_unset")
++    if not 0 <= protocol_bps <= 10_000 or not 0 <= creator_bps <= 10_000:
++        raise FailClosed("fee_bps")
++    if curve.creator == ZERO:
++        return protocol_bps, 0
++    if curve.creator_fee_bps and curve.creator_fee_bps != creator_bps:
++        raise FailClosed("creator_fee_conflict")
++    return protocol_bps, creator_bps
++
++
++def _slip(net: int, bps: int, up: bool) -> int:
++    if bps is None or bps < 0:
++        raise FailClosed("slippage_unset")
++    if bps > 10_000:
++        raise FailClosed("slippage")
++    moved = net * bps // 10_000
++    out = net + moved if up else net - moved
++    if out <= 0:
++        raise FailClosed("slippage")
++    return out
++
++
++def quote_buy(curve: Curve, tokens: int, protocol_bps: int | None,
++              creator_bps: int | None, slippage_bps: int | None,
++              impact_cap_bps: int | None) -> Quote:
++    if tokens <= 0:
++        raise FailClosed("amount")
++    if tokens > curve.real_token:
++        raise FailClosed("would_complete_curve")
++    if slippage_bps is None:
++        raise FailClosed("slippage_unset")
++    if impact_cap_bps is None:
++        raise FailClosed("price_impact_unset")
++    protocol, creator = _rates(curve, protocol_bps, creator_bps)
++    net = tokens * curve.virtual_quote // (curve.virtual_token - tokens) + 1
++    fee = ceil_fee(net, protocol) + ceil_fee(net, creator)
++    impact = net * 10_000 // curve.virtual_quote
++    if impact > impact_cap_bps:
++        raise FailClosed("price_impact")
++    return Quote(tokens, net, fee, _slip(net + fee, slippage_bps, True), impact)
++
++
++def quote_sell(curve: Curve, tokens: int, protocol_bps: int | None,
++               creator_bps: int | None, slippage_bps: int | None,
++               impact_cap_bps: int | None) -> Quote:
++    if tokens <= 0:
++        raise FailClosed("amount")
++    if slippage_bps is None:
++        raise FailClosed("slippage_unset")
++    if impact_cap_bps is None:
++        raise FailClosed("price_impact_unset")
++    protocol, creator = _rates(curve, protocol_bps, creator_bps)
++    gross = tokens * curve.virtual_quote // (curve.virtual_token + tokens)
++    fee = ceil_fee(gross, protocol) + ceil_fee(gross, creator)
++    net = gross - fee
++    if net <= 0:
++        raise FailClosed("fee_exceeds_output")
++    impact = gross * 10_000 // curve.virtual_quote
++    if impact > impact_cap_bps:
++        raise FailClosed("price_impact")
++    return Quote(tokens, net, fee, _slip(net, slippage_bps, False), impact)
++
++
++def _meta(pubkey: str, writable: bool, signer: bool = False) -> dict:
++    return {"pubkey": pubkey, "writable": writable, "signer": signer}
++
++
++def curve_accounts(user: str, mint: str, quote_mint: str, base_program: str,
++                   buyback: str) -> list[dict]:
++    if not buyback or buyback == ZERO:
++        raise FailClosed("buyback_recipient_unset")
++    quote_mint = normalize_quote(quote_mint)
++    curve = bonding_curve_pda(mint)
++    return [
++        _meta(global_pda(), False),
++        _meta(mint, False),
++        _meta(quote_mint, False),
++        _meta(base_program, False),
++        _meta(TOKEN_PROGRAM, False),
++        _meta(curve, True),
++        _meta(associated_token(curve, mint, base_program), True),
++        _meta(associated_token(curve, quote_mint, TOKEN_PROGRAM), True),
++        _meta(user, True, True),
++        _meta(associated_token(user, mint, base_program), True),
++        _meta(associated_token(user, quote_mint, TOKEN_PROGRAM), True),
++        _meta(user_volume_pda(user), True),
++        _meta(fee_config_pda(PUMP_PROGRAM), False),
++        _meta(buyback, True),
++        _meta(SYSTEM_PROGRAM, False),
++        _meta(event_authority(PUMP_PROGRAM), False),
++        _meta(PUMP_PROGRAM, False),
++    ]
++
++
++def build_curve_buy(user: str, mint: MintView, curve: Curve, tokens: int,
++                    protocol_bps: int | None, creator_bps: int | None,
++                    slippage_bps: int | None, impact_cap_bps: int | None,
++                    buyback: str, blockhash: bytes) -> Built:
++    classify(curve, mint)
++    q = quote_buy(curve, tokens, protocol_bps, creator_bps, slippage_bps, impact_cap_bps)
++    data = BUY_V3 + _u64(tokens) + _u64(q.limit_atoms) + bytes([0])
++    accounts = curve_accounts(user, mint.mint, curve.quote_mint, mint.program, buyback)
++    return Built("bonding_curve_v3", "buy", data, accounts,
++                 compile_message(user, accounts, data, blockhash), q)
++
++
++def build_curve_sell(user: str, mint: MintView, curve: Curve, tokens: int,
++                     protocol_bps: int | None, creator_bps: int | None,
++                     slippage_bps: int | None, impact_cap_bps: int | None,
++                     buyback: str, blockhash: bytes) -> Built:
++    classify(curve, mint)
++    q = quote_sell(curve, tokens, protocol_bps, creator_bps, slippage_bps, impact_cap_bps)
++    data = SELL_V3 + _u64(tokens) + _u64(q.limit_atoms)
++    accounts = curve_accounts(user, mint.mint, curve.quote_mint, mint.program, buyback)
++    return Built("bonding_curve_v3", "sell", data, accounts,
++                 compile_message(user, accounts, data, blockhash), q)
++
++
++@dataclass
++class PoolView:
++    pool: str
++    base_vault: int
++    quote_vault: int
++    virtual_quote: int
++    base_mint: str
++    quote_mint: str
++    pool_base: str
++    pool_quote: str
++    cashback: bool = False
++    mayhem: bool = False
++    disable_flags: int = 0
++    protocol_bps: int | None = None
++    creator_bps: int | None = None
++    lp_bps: int | None = None
++    buyback: str = ""
++
++
++def _pool_ok(pool: PoolView, side: str) -> None:
++    bit = 3 if side == "buy" else 4
++    if pool.disable_flags & (1 << bit):
++        raise FailClosed("pool_disabled")
++    if pool.cashback or pool.mayhem:
++        raise FailClosed("cashback" if pool.cashback else "mayhem")
++    normalize_quote(pool.quote_mint)
++    if pool.base_vault <= 0:
++        raise FailClosed("empty_reserves")
++    effective = pool.quote_vault + pool.virtual_quote
++    if effective <= 0:
++        raise FailClosed("empty_reserves")
++    for name in ("protocol_bps", "creator_bps", "lp_bps"):
++        rate = getattr(pool, name)
++        if rate is None:
++            raise FailClosed("fee_bps_unset")
++        if not 0 <= rate <= 10_000:
++            raise FailClosed("fee_bps")
++    if not pool.buyback or pool.buyback == ZERO:
++        raise FailClosed("buyback_recipient_unset")
++
++
++def _amm_quote(pool: PoolView, tokens: int, side: str,
++               slippage_bps: int | None, impact_cap_bps: int | None) -> Quote:
++    _pool_ok(pool, side)
++    if tokens <= 0 or slippage_bps is None or impact_cap_bps is None:
++        raise FailClosed("amount" if tokens <= 0 else
++                         "slippage_unset" if slippage_bps is None else "price_impact_unset")
++    effective = pool.quote_vault + pool.virtual_quote
++    if side == "buy":
++        if tokens >= pool.base_vault:
++            raise FailClosed("empty_reserves")
++        net = (effective * tokens + (pool.base_vault - tokens) - 1) // (pool.base_vault - tokens)
++        fee = sum(ceil_fee(net, r) for r in (pool.protocol_bps, pool.creator_bps, pool.lp_bps))
++        impact = net * 10_000 // effective
++        if impact > impact_cap_bps:
++            raise FailClosed("price_impact")
++        return Quote(tokens, net, fee, _slip(net + fee, slippage_bps, True), impact)
++    gross = tokens * effective // (pool.base_vault + tokens)
++    fee = sum(ceil_fee(gross, r) for r in (pool.protocol_bps, pool.creator_bps, pool.lp_bps))
++    net = gross - fee
++    if net <= 0:
++        raise FailClosed("fee_exceeds_output")
++    impact = gross * 10_000 // effective
++    if impact > impact_cap_bps:
++        raise FailClosed("price_impact")
++    return Quote(tokens, net, fee, _slip(net, slippage_bps, False), impact)
++
++
++def amm_accounts(user: str, pool: PoolView, base_program: str) -> list[dict]:
++    quote = normalize_quote(pool.quote_mint)
++    return [
++        _meta(pool.pool, True),
++        _meta(user, True, True),
++        _meta(amm_global_pda(), False),
++        _meta(pool.base_mint, False),
++        _meta(quote, False),
++        _meta(associated_token(user, pool.base_mint, base_program), True),
++        _meta(associated_token(user, quote, TOKEN_PROGRAM), True),
++        _meta(pool.pool_base, True),
++        _meta(pool.pool_quote, True),
++        _meta(base_program, False),
++        _meta(TOKEN_PROGRAM, False),
++        _meta(SYSTEM_PROGRAM, False),
++        _meta(amm_user_volume_pda(user), True),
++        _meta(fee_config_pda(PUMP_AMM_PROGRAM), False),
++        _meta(pool.buyback, True),
++        _meta(event_authority(PUMP_AMM_PROGRAM), False),
++        _meta(PUMP_AMM_PROGRAM, False),
++    ]
++
++
++def build_amm(user: str, mint: MintView, pool: PoolView, tokens: int, side: str,
++              slippage_bps: int | None, impact_cap_bps: int | None,
++              blockhash: bytes, enabled: bool) -> Built:
++    if not enabled:
++        raise FailClosed("pumpswap_disabled")
++    if pool.base_mint != mint.mint:
++        raise FailClosed("mint_mismatch")
++    if mint.program not in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
++        raise FailClosed("unknown_token_program")
++    q = _amm_quote(pool, tokens, side, slippage_bps, impact_cap_bps)
++    disc = BUY_V2 if side == "buy" else SELL_V2
++    data = disc + _u64(tokens) + _u64(q.limit_atoms)
++    accounts = amm_accounts(user, pool, mint.program)
++    return Built("pumpswap_v2", side, data, accounts,
++                 compile_message(user, accounts, data, blockhash), q)
++
++
++def _compact(n: int) -> bytes:
++    if n < 0x80:
++        return bytes([n])
++    if n < 0x4000:
++        return bytes([(n & 0x7F) | 0x80, n >> 7])
++    raise FailClosed("compact_too_long")
++
++
++def compile_message(payer: str, accounts: list[dict], data: bytes, blockhash: bytes) -> bytes:
++    if not isinstance(blockhash, (bytes, bytearray)) or len(blockhash) != 32:
++        raise FailClosed("blockhash_required")
++    merged: dict[str, list] = {}
++
++    def upsert(pubkey: str, signer: bool, writable: bool) -> None:
++        slot = merged.get(pubkey)
++        if slot is None:
++            merged[pubkey] = [signer, writable]
++        else:
++            slot[0] = slot[0] or signer
++            slot[1] = slot[1] or writable
++
++    upsert(payer, True, True)
++    program = accounts[-1]["pubkey"]
++    upsert(program, False, False)
++    for meta in accounts:
++        upsert(meta["pubkey"], meta["signer"], meta["writable"])
++    sign_w = [k for k in merged if merged[k][0] and merged[k][1]]
++    sign_r = [k for k in merged if merged[k][0] and not merged[k][1]]
++    rest_w = [k for k in merged if not merged[k][0] and merged[k][1]]
++    rest_r = [k for k in merged if not merged[k][0] and not merged[k][1]]
++    ordered = sign_w + sign_r + rest_w + rest_r
++    index = {k: i for i, k in enumerate(ordered)}
++    header = bytes([
++        len(sign_w) + len(sign_r),
++        len(sign_r),
++        len(rest_r),
++    ])
++    body = b"".join(b58decode(k) for k in ordered)
++    ix_accounts = bytes(index[m["pubkey"]] for m in accounts)
++    ix = bytes([index[program]]) + _compact(len(ix_accounts)) + ix_accounts + _compact(len(data)) + data
++    return header + _compact(len(ordered)) + body + bytes(blockhash) + _compact(1) + ix
+--- a/pump_exec.py
++++ b/pump_exec.py
+@@ -0,0 +1,452 @@
++"""Disabled pump.fun order ledger. Builds unsigned transactions and stops.
++
++The signer refuses every hand-off, so a row never reaches awaiting confirmation
++from this process. Fills happen only when a test or a future confirmer records
++a signature and both token and quote deltas. The desk's own positions,
++activity, balance, signals and scans are not written.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++from agents.common import b58decode
++from agents.risk import evaluate as risk_evaluate
++from pump_curve import (
++    Built,
++    Curve,
++    FailClosed,
++    MintView,
++    PoolView,
++    build_amm,
++    build_curve_buy,
++    build_curve_sell,
++    classify,
++    decode_curve,
++)
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS orders (
++    intent_id TEXT PRIMARY KEY,
++    mint TEXT NOT NULL,
++    side TEXT NOT NULL,
++    status TEXT NOT NULL,
++    venue TEXT,
++    tokens INTEGER,
++    limit_atoms INTEGER,
++    fee_atoms INTEGER,
++    notional_usd REAL,
++    decimals INTEGER,
++    message BLOB,
++    reason TEXT,
++    note TEXT,
++    attempts INTEGER NOT NULL DEFAULT 0,
++    provenance TEXT NOT NULL DEFAULT 'unsigned',
++    created_at REAL,
++    updated_at REAL,
++    signature_ok INTEGER,
++    token_delta INTEGER,
++    quote_delta INTEGER,
++    sol_usd REAL
++);
++CREATE TABLE IF NOT EXISTS mint_locks (
++    mint TEXT PRIMARY KEY,
++    intent_id TEXT NOT NULL,
++    acquired_at REAL
++);
++CREATE TABLE IF NOT EXISTS live_positions (
++    mint TEXT PRIMARY KEY,
++    buy_intent TEXT,
++    qty INTEGER,
++    entry_price REAL,
++    size_usd REAL,
++    peak_price REAL,
++    stop_price REAL,
++    trail_active INTEGER,
++    opened_at REAL,
++    status TEXT,
++    exit_reason TEXT,
++    closed_at REAL,
++    pnl_usd REAL
++);
++"""
++
++LIMITS = (
++    "max_position_usd", "max_exposure_usd", "max_positions", "max_daily_loss_usd",
++    "max_quote_age_s", "max_slippage_bps", "max_price_impact_bps",
++    "fee_reserve_lamports", "fee_cap_lamports",
++)
++OPEN = ("open", "exit_failed")
++INFLIGHT = ("built_unsigned", "awaiting_confirm")
++UNFILLED = ("built_unsigned", "awaiting_confirm", "confirmed_unfilled")
++BUILD_CAP = 3
++NETWORKS = ("mainnet-beta", "devnet")
++
++
++class SignerDisabled(FailClosed):
++    def __init__(self):
++        super().__init__("signer_disabled")
++
++
++class DisabledSigner:
++    """No key is loaded. Every call refuses."""
++
++    def sign(self, message: bytes) -> None:
++        raise SignerDisabled()
++
++
++@dataclass
++class Ticket:
++    intent_id: str
++    user: str
++    mint: MintView
++    curve: Curve | None
++    pool: PoolView | None
++    tokens: int
++    protocol_bps: int | None
++    creator_bps: int | None
++    buyback: str
++    blockhash: bytes | None
++    observed_at: float | None
++    sol_usd: float | None
++    lamports: int | None
++    now: float
++    pumpswap: bool = False
++
++
++def evaluate_arm(who: str, typed: str | None, limits: dict | None, *,
++                 night_done: bool, reviewed: bool) -> tuple[bool, list[str]]:
++    """Every condition, every time. desk.mode is not an input."""
++    bad: list[str] = []
++    if who == "telegram":
++        bad.append("telegram")
++    if typed != "LIVE":
++        bad.append("typed_live")
++    if not night_done:
++        bad.append("paper_night")
++    if not reviewed:
++        bad.append("review")
++    if not isinstance(limits, dict):
++        return False, bad + ["limits"]
++    if limits.get("kill_switch") is not False:
++        bad.append("kill_switch")
++    wallet = limits.get("wallet")
++    try:
++        raw = b58decode(wallet) if type(wallet) is str else b""
++    except Exception:
++        raw = b""
++    if len(raw) != 32:
++        bad.append("wallet")
++    if limits.get("network") not in NETWORKS:
++        bad.append("network")
++    for key in LIMITS:
++        value = limits.get(key)
++        if type(value) is not int and type(value) is not float:
++            bad.append(key)
++        elif value < 0:
++            bad.append(key)
++    return (not bad), bad
++
++
++def ingest(items: list[dict], *, enabled: bool) -> dict:
++    """Classify supplied account bytes. Disabled returns nothing and does not trade."""
++    if not enabled:
++        return {"enabled": False, "rows": []}
++    rows = []
++    for item in items:
++        mint = item.get("mint_view")
++        try:
++            curve = decode_curve(item["data"])
++            phase = classify(curve, mint)
++            rows.append({"mint": mint.mint, "phase": phase, "tradable": False,
++                         "reason": "execution_disabled"})
++        except FailClosed as exc:
++            rows.append({"mint": getattr(mint, "mint", None), "phase": None,
++                         "tradable": False, "reason": exc.reason})
++        except (AttributeError, TypeError):
++            rows.append({"mint": getattr(mint, "mint", None), "phase": None,
++                         "tradable": False, "reason": "not_a_bonding_curve"})
++    return {"enabled": True, "rows": rows}
++
++
++class Ledger:
++    def __init__(self, path: str | Path):
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        self.path = str(path)
++        self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
++        self.conn.row_factory = sqlite3.Row
++        self.conn.executescript(SCHEMA)
++
++    def close(self) -> None:
++        self.conn.close()
++
++    def get(self, intent_id: str) -> dict | None:
++        row = self.conn.execute("SELECT * FROM orders WHERE intent_id=?", (intent_id,)).fetchone()
++        return dict(row) if row else None
++
++    def position(self, mint: str) -> dict | None:
++        row = self.conn.execute("SELECT * FROM live_positions WHERE mint=?", (mint,)).fetchone()
++        return dict(row) if row else None
++
++    def reconcile(self) -> dict:
++        """Restart: a broadcast that was awaiting confirmation is held, not retried or filled."""
++        held = 0
++        rows = self.conn.execute(
++            "SELECT intent_id, note FROM orders WHERE status='awaiting_confirm'").fetchall()
++        for row in rows:
++            if row["note"] != "reconcile_hold":
++                self.conn.execute(
++                    "UPDATE orders SET note='reconcile_hold', updated_at=? WHERE intent_id=?",
++                    (time.time(), row["intent_id"]))
++            held += 1
++        return {"held": held, "retried": 0, "filled": 0}
++
++    def prepare(self, ticket: Ticket, *, who: str, typed: str | None, limits: dict | None,
++                night_done: bool, reviewed: bool) -> dict:
++        existing = self.get(ticket.intent_id)
++        if existing:
++            return existing
++        ok, reasons = evaluate_arm(who, typed, limits, night_done=night_done, reviewed=reviewed)
++        if not ok:
++            return self._store_rejected(ticket, ";".join(reasons))
++        side = _side(ticket)
++        if self._unfilled(ticket.mint.mint, side) >= BUILD_CAP:
++            return self._store_rejected(ticket, "attempts_exhausted")
++        if not self._lock(ticket.mint.mint, ticket.intent_id, ticket.now):
++            return self._store_rejected(ticket, "mint_locked")
++        try:
++            self._age(ticket, limits)
++            built = self._build(ticket, limits)
++            self._afford(ticket, built, limits, side)
++        except FailClosed as exc:
++            self._unlock(ticket.mint.mint, ticket.intent_id)
++            return self._store_rejected(ticket, exc.reason)
++        return self._store_built(ticket, built, side)
++
++    def hand_off(self, intent_id: str, signer: DisabledSigner | None = None) -> None:
++        row = self.get(intent_id)
++        if row is None or row["status"] != "built_unsigned":
++            raise FailClosed("not_built")
++        (signer or DisabledSigner()).sign(row["message"])
++
++    def observe(self, intent_id: str, *, signature_ok: bool, token_delta: int | None,
++                quote_delta: int | None, now: float) -> dict:
++        """Record a result that something else already saw. Does not retry."""
++        row = self.get(intent_id)
++        if row is None or row["status"] != "awaiting_confirm":
++            raise FailClosed("not_awaiting")
++        good = signature_ok and token_delta is not None and quote_delta is not None and (
++            (row["side"] == "buy" and token_delta > 0 and quote_delta < 0) or
++            (row["side"] == "sell" and token_delta < 0 and quote_delta > 0))
++        if not good:
++            self.conn.execute(
++                "UPDATE orders SET status='confirmed_unfilled', signature_ok=?, token_delta=?, "
++                "quote_delta=?, provenance='chain_unfilled', updated_at=? WHERE intent_id=?",
++                (int(bool(signature_ok)), token_delta, quote_delta, now, intent_id))
++            self._unlock(row["mint"], intent_id)
++            return self.get(intent_id)
++        self.conn.execute(
++            "UPDATE orders SET status='filled', signature_ok=1, token_delta=?, quote_delta=?, "
++            "provenance='chain_delta', updated_at=? WHERE intent_id=?",
++            (token_delta, quote_delta, now, intent_id))
++        if row["side"] == "buy":
++            self._open_position(row, token_delta, quote_delta, now)
++        else:
++            self._close_position(row, quote_delta, now)
++            self.conn.execute("DELETE FROM mint_locks WHERE mint=?", (row["mint"],))
++        return self.get(intent_id)
++
++    def plan_exit(self, mint: str, price: float, now: float, risk_cfg: dict, ticket: Ticket, *,
++                  who: str, typed: str | None, limits: dict | None, night_done: bool,
++                  reviewed: bool) -> dict | None:
++        pos = self.position(mint)
++        if pos is None or pos["status"] not in OPEN:
++            return None
++        try:
++            upd, reason = risk_evaluate(pos, price, now, risk_cfg)
++        except (KeyError, TypeError) as exc:
++            return self._exit_failed(pos, ticket, f"risk_cfg:{type(exc).__name__}", now)
++        self.conn.execute(
++            "UPDATE live_positions SET peak_price=?, stop_price=?, trail_active=? WHERE mint=?",
++            (upd["peak_price"], upd["stop_price"], upd["trail_active"], mint))
++        if not reason:
++            return None
++        ticket.intent_id = f"{pos['buy_intent']}:exit:{reason}"
++        ticket.tokens = int(pos["qty"])
++        existing = self.get(ticket.intent_id)
++        if existing:
++            return existing
++        ok, reasons = evaluate_arm(who, typed, limits, night_done=night_done, reviewed=reviewed)
++        if not ok:
++            return self._exit_failed(pos, ticket, ";".join(reasons), now)
++        try:
++            self._age(ticket, limits)
++            built = self._build(ticket, limits)
++            if built.side != "sell":
++                raise FailClosed("unsupported_phase")
++            self._fee_only(built, limits)
++        except FailClosed as exc:
++            return self._exit_failed(pos, ticket, exc.reason, now)
++        self.conn.execute(
++            "UPDATE live_positions SET status='open', exit_reason=? WHERE mint=?", (reason, mint))
++        return self._store_built(ticket, built, "sell", note=reason)
++
++    # ---- internals
++    def _build(self, ticket: Ticket, limits: dict) -> Built:
++        slip, impact = limits.get("max_slippage_bps"), limits.get("max_price_impact_bps")
++        curve = ticket.curve
++        if curve is not None and not curve.complete:
++            if _side(ticket) == "sell":
++                return build_curve_sell(
++                    ticket.user, ticket.mint, curve, ticket.tokens, ticket.protocol_bps,
++                    ticket.creator_bps, slip, impact, ticket.buyback, ticket.blockhash)
++            return build_curve_buy(
++                ticket.user, ticket.mint, curve, ticket.tokens, ticket.protocol_bps,
++                ticket.creator_bps, slip, impact, ticket.buyback, ticket.blockhash)
++        if ticket.pool is not None:
++            return build_amm(
++                ticket.user, ticket.mint, ticket.pool, ticket.tokens, _side(ticket),
++                slip, impact, ticket.blockhash, bool(ticket.pumpswap))
++        raise FailClosed("unsupported_phase")
++
++    def _age(self, ticket: Ticket, limits: dict) -> None:
++        cap = limits.get("max_quote_age_s")
++        if type(cap) not in (int, float) or ticket.observed_at is None:
++            raise FailClosed("quote_age")
++        if ticket.now - ticket.observed_at > cap or ticket.observed_at - ticket.now > 5:
++            raise FailClosed("quote_age")
++
++    def _afford(self, ticket: Ticket, built: Built, limits: dict, side: str) -> None:
++        self._fee_only(built, limits)
++        if ticket.sol_usd is None or ticket.sol_usd <= 0:
++            raise FailClosed("usd_price_unset")
++        if ticket.lamports is None:
++            raise FailClosed("fee_reserve_balance_unset")
++        notional = built.quote.limit_atoms / 1_000_000_000 * ticket.sol_usd
++        built.quote.notional = notional  # type: ignore[attr-defined]
++        if side == "sell":
++            if ticket.lamports < limits["fee_reserve_lamports"]:
++                raise FailClosed("fee_reserve")
++            return
++        if notional > limits["max_position_usd"]:
++            raise FailClosed("max_position_usd")
++        exposure = self._exposure() + notional
++        if exposure > limits["max_exposure_usd"]:
++            raise FailClosed("max_exposure_usd")
++        if self._open_count() + 1 > limits["max_positions"]:
++            raise FailClosed("max_positions")
++        loss = self._day_loss(ticket.now - 86400)
++        if loss >= limits["max_daily_loss_usd"]:
++            raise FailClosed("max_daily_loss_usd")
++        if ticket.lamports - built.quote.limit_atoms < limits["fee_reserve_lamports"]:
++            raise FailClosed("fee_reserve")
++
++    def _fee_only(self, built: Built, limits: dict) -> None:
++        cap = limits.get("fee_cap_lamports")
++        if type(cap) not in (int, float) or built.quote.fee_atoms > cap:
++            raise FailClosed("fee_cap")
++
++    def _store_built(self, ticket: Ticket, built: Built, side: str, note: str | None = None) -> dict:
++        notional = getattr(built.quote, "notional", None)
++        if notional is None and ticket.sol_usd:
++            notional = built.quote.limit_atoms / 1_000_000_000 * ticket.sol_usd
++        self.conn.execute(
++            "INSERT INTO orders(intent_id,mint,side,status,venue,tokens,limit_atoms,fee_atoms,"
++            "notional_usd,decimals,message,reason,note,attempts,provenance,created_at,updated_at,sol_usd) "
++            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
++            (ticket.intent_id, ticket.mint.mint, side, "built_unsigned", built.venue,
++             built.quote.tokens, built.quote.limit_atoms, built.quote.fee_atoms, notional,
++             ticket.mint.decimals, built.message, None, note, 1, "unsigned", ticket.now,
++             ticket.now, ticket.sol_usd))
++        return self.get(ticket.intent_id)
++
++    def _store_rejected(self, ticket: Ticket, reason: str) -> dict:
++        self.conn.execute(
++            "INSERT INTO orders(intent_id,mint,side,status,reason,attempts,provenance,created_at,updated_at) "
++            "VALUES(?,?,?,?,?,?,?,?,?)",
++            (ticket.intent_id, ticket.mint.mint, _side(ticket), "rejected", reason, 0,
++             "unsigned", ticket.now, ticket.now))
++        return self.get(ticket.intent_id)
++
++    def _exit_failed(self, pos: dict, ticket: Ticket, reason: str, now: float) -> dict:
++        self.conn.execute(
++            "UPDATE live_positions SET status='exit_failed', exit_reason=? WHERE mint=?",
++            (reason, pos["mint"]))
++        self.conn.execute(
++            "INSERT INTO orders(intent_id,mint,side,status,reason,note,attempts,provenance,created_at,updated_at) "
++            "VALUES(?,?,?,?,?,?,?,?,?,?)",
++            (ticket.intent_id, pos["mint"], "sell", "exit_failed", reason, reason, 0,
++             "unsigned", now, now))
++        return self.get(ticket.intent_id)
++
++    def _open_position(self, row: dict, token_delta: int, quote_delta: int, now: float) -> None:
++        # Size follows the observed quote spent, not the pre-trade cap.
++        sol = row["sol_usd"] or 0
++        size = abs(quote_delta) / 1_000_000_000 * sol
++        decimals = int(row["decimals"] if row["decimals"] is not None else 0)
++        entry = size * (10 ** decimals) / token_delta if token_delta else 0
++        self.conn.execute(
++            "INSERT INTO live_positions(mint,buy_intent,qty,entry_price,size_usd,peak_price,"
++            "stop_price,trail_active,opened_at,status) VALUES(?,?,?,?,?,?,?,?,?,?)",
++            (row["mint"], row["intent_id"], token_delta, entry, size, entry, None, 0, now, "open"))
++
++    def _close_position(self, row: dict, quote_delta: int, now: float) -> None:
++        pos = self.position(row["mint"])
++        if pos is None:
++            return
++        proceeds = (quote_delta / 1_000_000_000) * (row["sol_usd"] or 0)
++        pnl = proceeds - (pos["size_usd"] or 0)
++        self.conn.execute(
++            "UPDATE live_positions SET status='closed', closed_at=?, pnl_usd=? WHERE mint=?",
++            (now, pnl, row["mint"]))
++        self.conn.execute("UPDATE orders SET notional_usd=? WHERE intent_id=? AND notional_usd IS NULL",
++                          (proceeds, row["intent_id"]))
++
++    def _lock(self, mint: str, intent_id: str, now: float) -> bool:
++        try:
++            self.conn.execute("INSERT INTO mint_locks(mint,intent_id,acquired_at) VALUES(?,?,?)",
++                              (mint, intent_id, now))
++            return True
++        except sqlite3.IntegrityError:
++            row = self.conn.execute("SELECT intent_id FROM mint_locks WHERE mint=?", (mint,)).fetchone()
++            return bool(row and row["intent_id"] == intent_id)
++
++    def _unlock(self, mint: str, intent_id: str) -> None:
++        self.conn.execute("DELETE FROM mint_locks WHERE mint=? AND intent_id=?", (mint, intent_id))
++
++    def _unfilled(self, mint: str, side: str) -> int:
++        row = self.conn.execute(
++            f"SELECT COUNT(*) AS n FROM orders WHERE mint=? AND side=? AND status IN ({','.join('?' * len(UNFILLED))})",
++            (mint, side, *UNFILLED)).fetchone()
++        return int(row["n"])
++
++    def _exposure(self) -> float:
++        inflight = self.conn.execute(
++            "SELECT COALESCE(SUM(notional_usd),0) AS n FROM orders WHERE side='buy' AND status IN ('built_unsigned','awaiting_confirm')"
++        ).fetchone()["n"]
++        opened = self.conn.execute(
++            "SELECT COALESCE(SUM(size_usd),0) AS n FROM live_positions WHERE status IN ('open','exit_failed')"
++        ).fetchone()["n"]
++        return float(inflight or 0) + float(opened or 0)
++
++    def _open_count(self) -> int:
++        inflight = self.conn.execute(
++            "SELECT COUNT(*) AS n FROM orders WHERE side='buy' AND status IN ('built_unsigned','awaiting_confirm')"
++        ).fetchone()["n"]
++        opened = self.conn.execute(
++            "SELECT COUNT(*) AS n FROM live_positions WHERE status IN ('open','exit_failed')"
++        ).fetchone()["n"]
++        return int(inflight or 0) + int(opened or 0)
++
++    def _day_loss(self, since: float) -> float:
++        row = self.conn.execute(
++            "SELECT COALESCE(SUM(-pnl_usd),0) AS n FROM live_positions WHERE status='closed' AND pnl_usd<0 AND closed_at>=?",
++            (since,)).fetchone()
++        return float(row["n"] or 0)
++
++
++def _side(ticket: Ticket) -> str:
++    return "sell" if ":exit:" in ticket.intent_id else "buy"
+--- a/agents/pump_live.py
++++ b/agents/pump_live.py
+@@ -0,0 +1,36 @@
++"""Disabled pump.fun worker. Reconciles the side ledger, then waits.
++
++It does not read the network, does not publish a candidate, and does not
++heartbeat. A heartbeat would make health.py treat this task as a pipeline agent.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from pathlib import Path
++
++from agents.common import Agent
++from pump_exec import Ledger
++
++
++def ledger_path(db_path: str) -> Path:
++    return Path(db_path).with_name("pump_orders.db")
++
++
++class PumpLive(Agent):
++    name = "pump_live"
++
++    async def run(self):
++        path = ledger_path(self.ctx.db.path)
++        # Absent file stays absent. Opening it is what creates the side ledger.
++        if path.exists():
++            try:
++                book = Ledger(path)
++                try:
++                    book.reconcile()
++                finally:
++                    book.close()
++            except Exception:
++                self.log.exception("pump ledger reconcile failed closed")
++        while True:
++            await asyncio.sleep(3600)
+--- a/tests/test_pump_live.py
++++ b/tests/test_pump_live.py
+@@ -0,0 +1,398 @@
++"""Disabled pump.fun curve path. Offline only: no RPC, no signer, no desk history writes."""
++import asyncio
++from pathlib import Path
++
++import pytest
++
++from agents.common import TOKEN_2022_PROGRAM, TOKEN_PROGRAM, bonding_curve
++from agents.pump_live import PumpLive
++from agents.risk import evaluate
++from bus import Bus
++from commands import Commands
++from config import DEFAULTS
++from config import test_config as desk_config
++from db import DB
++from agents.common import Ctx
++from pump_curve import (
++    BUY_V2,
++    BUY_V3,
++    SELL_V3,
++    ZERO,
++    Curve,
++    FailClosed,
++    MintView,
++    PoolView,
++    build_curve_buy,
++    curve_accounts,
++    decode_curve,
++    discovery_request,
++    encode_curve,
++    quote_buy,
++)
++from pump_exec import DisabledSigner, Ledger, SignerDisabled, Ticket, evaluate_arm, ingest
++
++MINT = "31SYoqWFhx3i9UsfnoXTjFp4ZwJA8F8UPrMxymfDpump"
++USER = "HmcVp73ePenjn2JDHQBws6sYN56aBCmPuGDGouqzNUok"
++CREATOR = "HN9YV4zbrsSjGwrLkr17ebbmCv99U34j7FuRcDtHjtZ9"
++OTHER = "9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz"
++ROOT = Path(__file__).resolve().parents[1]
++NOW = 1_800_000_000.0
++BLOCK = bytes(range(32))
++
++
++def ctx(tmp_path):
++    db = DB(tmp_path / "desk.db")
++    return Ctx(cfg=desk_config(), db=db, bus=Bus(), http=None, offline=True)
++
++
++def mint_view(program=TOKEN_PROGRAM, **kw):
++    base = dict(mint=MINT, program=program, decimals=6, mint_authority=None, freeze_authority=None)
++    base.update(kw)
++    return MintView(**base)
++
++
++def curve(**kw):
++    base = dict(
++        virtual_token=1_000_000_000_000, virtual_quote=30_000_000_000,
++        real_token=800_000_000_000, real_quote=1_000_000_000, supply=1_000_000_000_000,
++        complete=False, creator=CREATOR, mayhem=False, cashback=False, quote_mint=ZERO,
++        creator_fee_bps=0, holder_reward=False, depth=0,
++    )
++    base.update(kw)
++    return Curve(**base)
++
++
++def limits(**kw):
++    base = dict(
++        max_position_usd=25, max_exposure_usd=50, max_positions=2, max_daily_loss_usd=10,
++        max_quote_age_s=30, max_slippage_bps=100, max_price_impact_bps=500,
++        fee_reserve_lamports=5_000, fee_cap_lamports=100_000,
++        kill_switch=False, wallet=USER, network="devnet",
++    )
++    base.update(kw)
++    return base
++
++
++def ticket(tmp=None, **kw):
++    base = dict(
++        intent_id="buy-1", user=USER, mint=mint_view(), curve=curve(), pool=None,
++        tokens=1_000_000, protocol_bps=100, creator_bps=30, buyback=OTHER,
++        blockhash=BLOCK, observed_at=NOW, sol_usd=100.0, lamports=1_000_000_000, now=NOW,
++    )
++    base.update(kw)
++    return Ticket(**base)
++
++
++def arm_ok():
++    return dict(who="cli", typed="LIVE", limits=limits(), night_done=True, reviewed=True)
++
++
++def book(tmp_path):
++    return Ledger(tmp_path / "pump_orders.db")
++
++
++def dump(db: DB):
++    return {name: db.q(f"SELECT * FROM {name}") for name in (
++        "coins", "scans", "audits", "verdicts", "signals", "positions", "activity",
++        "prices", "balance", "settings", "change_log", "skips")}
++
++
++# ---------------------------------------------------------------- quotes and instructions
++def test_buy_quote_matches_curve_math_and_v3_layout():
++    c = curve()
++    tokens = 1_000_000
++    net = tokens * c.virtual_quote // (c.virtual_token - tokens) + 1
++    fee = (net * 100 + 9_999) // 10_000 + (net * 30 + 9_999) // 10_000
++    q = quote_buy(c, tokens, 100, 30, 100, 500)
++    assert q.net_atoms == net and q.fee_atoms == fee
++    assert q.limit_atoms == (net + fee) + (net + fee) * 100 // 10_000
++    built = build_curve_buy(USER, mint_view(), c, tokens, 100, 30, 100, 500, OTHER, BLOCK)
++    assert built.data[:8] == BUY_V3
++    assert built.data[-1:] == b"\x00"  # partial fill stays off
++    assert len(built.accounts) == 17
++    assert built.accounts[1]["pubkey"] == MINT
++    assert built.accounts[5]["pubkey"] == bonding_curve(MINT)
++    assert built.accounts[8]["signer"] and built.accounts[16]["pubkey"].startswith("6EF8")
++    assert built.message[0] == 1 and BLOCK in built.message
++    again = curve_accounts(USER, MINT, ZERO, TOKEN_PROGRAM, OTHER)
++    assert [a["pubkey"] for a in again] == [a["pubkey"] for a in built.accounts]
++
++
++def test_structural_rejects_and_short_curve():
++    view = mint_view()
++    raw = encode_curve(curve())
++    assert decode_curve(raw[:49]).quote_mint == ZERO
++    assert decode_curve(raw[:82]).mayhem is False
++    from pump_curve import classify
++    short = decode_curve(encode_curve(curve(mayhem=True))[:82])
++    with pytest.raises(FailClosed) as exc:
++        classify(short, view)
++    assert exc.value.reason == "mayhem"
++    with pytest.raises(FailClosed) as tail:
++        decode_curve(raw + b"\x01")
++    assert tail.value.reason == "unknown_curve_tail"
++    cases = [
++        (curve(cashback=True), view, "cashback"),
++        (curve(complete=True), view, "curve_complete"),
++        (curve(depth=1), view, "quote_chain"),
++        (curve(quote_mint=CREATOR), view, "non_sol_quote"),
++        (curve(), mint_view(mint_authority=USER), "authority_set"),
++        (curve(), mint_view(freeze_authority=USER), "authority_set"),
++        (curve(), mint_view(program="not-a-program"), "unknown_token_program"),
++    ]
++    from pump_curve import classify
++    for c, m, reason in cases:
++        with pytest.raises(FailClosed) as err:
++            classify(c, m)
++        assert err.value.reason == reason
++    with pytest.raises(FailClosed) as over:
++        quote_buy(curve(), curve().real_token + 1, 100, 30, 100, 10_000)
++    assert over.value.reason == "would_complete_curve"
++    with pytest.raises(FailClosed) as clash:
++        quote_buy(curve(creator_fee_bps=50), 1_000_000, 100, 30, 100, 500)
++    assert clash.value.reason == "creator_fee_conflict"
++    with pytest.raises(FailClosed) as unset:
++        quote_buy(curve(), 1_000_000, None, 30, 100, 500)
++    assert unset.value.reason == "fee_bps_unset"
++
++
++def test_token2022_base_program_is_passed_through():
++    built = build_curve_buy(USER, mint_view(program=TOKEN_2022_PROGRAM), curve(),
++                            1_000_000, 100, 30, 100, 500, OTHER, BLOCK)
++    assert built.accounts[3]["pubkey"] == TOKEN_2022_PROGRAM
++    classic = build_curve_buy(USER, mint_view(), curve(), 1_000_000, 100, 30, 100, 500, OTHER, BLOCK)
++    assert built.accounts[6]["pubkey"] != classic.accounts[6]["pubkey"]
++
++
++def test_discovery_is_official_and_disabled_ingest_drops_rows():
++    req = discovery_request()
++    assert req["sent"] is False and req["method"] == "getProgramAccounts"
++    assert req["unsupported"] == ["pumpportal"]
++    assert all("dataSize" not in f for f in req["filters"])
++    blob = {"data": encode_curve(curve()), "mint_view": mint_view()}
++    assert ingest([blob], enabled=False) == {"enabled": False, "rows": []}
++    seen = ingest([blob], enabled=True)
++    assert seen["rows"][0]["tradable"] is False
++    assert seen["rows"][0]["reason"] == "execution_disabled"
++    bad = ingest([{"data": encode_curve(curve(cashback=True)), "mint_view": mint_view()}], enabled=True)
++    assert bad["rows"][0]["reason"] == "cashback" and bad["rows"][0]["tradable"] is False
++
++
++def test_pumpswap_adapter_is_off_until_asked_and_still_unsigned():
++    pool = PoolView(
++        pool=OTHER, base_vault=1_000_000_000, quote_vault=5_000_000_000, virtual_quote=0,
++        base_mint=MINT, quote_mint=ZERO, pool_base=USER, pool_quote=CREATOR,
++        protocol_bps=25, creator_bps=30, lp_bps=20, buyback=OTHER,
++    )
++    from pump_curve import build_amm
++    with pytest.raises(FailClosed) as off:
++        build_amm(USER, mint_view(), pool, 1_000_000, "buy", 100, 500, BLOCK, False)
++    assert off.value.reason == "pumpswap_disabled"
++    missing = PoolView(**{**pool.__dict__, "lp_bps": None})
++    with pytest.raises(FailClosed) as fees:
++        build_amm(USER, mint_view(), missing, 1_000_000, "buy", 100, 500, BLOCK, True)
++    assert fees.value.reason == "fee_bps_unset"
++    blocked = PoolView(**{**pool.__dict__, "disable_flags": 1 << 3})
++    with pytest.raises(FailClosed) as flag:
++        build_amm(USER, mint_view(), blocked, 1_000_000, "buy", 100, 500, BLOCK, True)
++    assert flag.value.reason == "pool_disabled"
++    built = build_amm(USER, mint_view(), pool, 1_000_000, "sell", 100, 500, BLOCK, True)
++    assert built.data[:8] == bytes([93, 246, 130, 60, 231, 233, 64, 178])
++    assert built.venue == "pumpswap_v2" and len(built.accounts) == 17
++    buy = build_amm(USER, mint_view(), pool, 1_000_000, "buy", 100, 500, BLOCK, True)
++    assert buy.data[:8] == BUY_V2
++
++
++# ---------------------------------------------------------------- ledger gates
++def test_arm_ignores_desk_mode_and_telegram_and_missing_limits():
++    ok, bad = evaluate_arm("telegram", "LIVE", limits(), night_done=True, reviewed=True)
++    assert not ok and "telegram" in bad
++    ok, bad = evaluate_arm("cli", "LIVE", limits(kill_switch=True), night_done=True, reviewed=True)
++    assert "kill_switch" in bad
++    ok, bad = evaluate_arm("cli", "LIVE", {k: v for k, v in limits().items() if k != "kill_switch"},
++                           night_done=True, reviewed=True)
++    assert "kill_switch" in bad  # missing means engaged
++    ok, bad = evaluate_arm("cli", "live", limits(), night_done=True, reviewed=True)
++    assert "typed_live" in bad
++    ok, _ = evaluate_arm(**arm_ok())
++    assert ok
++
++
++def test_prepare_builds_unsigned_then_signer_refuses(tmp_path):
++    desk = ctx(tmp_path)
++    desk.cfg["desk"]["mode"] = "LIVE"  # a generic mode must not be the gate
++    led = book(tmp_path)
++    before = dump(desk.db)
++    refused = led.prepare(ticket(intent_id="nope"), who="cli", typed="LIVE",
++                          limits=limits(max_position_usd=None), night_done=True, reviewed=True)
++    assert refused["status"] == "rejected" and refused["message"] is None
++    row = led.prepare(ticket(), **arm_ok())
++    assert row["status"] == "built_unsigned" and row["provenance"] == "unsigned"
++    assert row["message"][:1] == b"\x01" and bytes(row["message"]).find(BUY_V3) > 0
++    again = led.prepare(ticket(), **arm_ok())
++    assert again["attempts"] == 1 and again["message"] == row["message"]
++    with pytest.raises(SignerDisabled):
++        led.hand_off(row["intent_id"], DisabledSigner())
++    assert led.get(row["intent_id"])["status"] == "built_unsigned"
++    assert led.get(row["intent_id"])["signature_ok"] is None
++    assert dump(desk.db) == before
++    led.close()
++
++
++def test_quote_age_slippage_impact_and_reserve_fail_closed(tmp_path):
++    led = book(tmp_path)
++    stale = led.prepare(ticket(intent_id="stale", observed_at=NOW - 31), **arm_ok())
++    assert stale["reason"] == "quote_age"
++    wide = led.prepare(ticket(intent_id="wide", tokens=100_000_000_000), **arm_ok())
++    assert wide["reason"] == "price_impact"
++    poor = led.prepare(ticket(intent_id="poor", lamports=5_000), **arm_ok())
++    assert poor["reason"] == "fee_reserve"
++    assert led.conn.execute("SELECT COUNT(*) AS n FROM mint_locks").fetchone()["n"] == 0
++    led.close()
++
++
++def test_mint_lock_attempt_cap_and_restart_hold(tmp_path):
++    led = book(tmp_path)
++    first = led.prepare(ticket(), **arm_ok())
++    assert first["status"] == "built_unsigned"
++    second = led.prepare(ticket(intent_id="buy-2"), **arm_ok())
++    assert second["status"] == "rejected" and second["reason"] == "mint_locked"
++    led.conn.execute("UPDATE orders SET status='confirmed_unfilled' WHERE intent_id='buy-1'")
++    led.conn.execute("DELETE FROM mint_locks")
++    for i in (2, 3):
++        led.conn.execute(
++            "INSERT INTO orders(intent_id,mint,side,status,attempts,provenance,created_at,updated_at) "
++            "VALUES(?,?,?,?,?,?,?,?)",
++            (f"old-{i}", MINT, "buy", "confirmed_unfilled", 1, "unsigned", NOW, NOW))
++    capped = led.prepare(ticket(intent_id="buy-4"), **arm_ok())
++    assert capped["reason"] == "attempts_exhausted"
++    led.conn.execute("UPDATE orders SET status='awaiting_confirm', attempts=1, note=NULL WHERE intent_id='buy-1'")
++    led.close()
++    restarted = Ledger(tmp_path / "pump_orders.db")
++    summary = restarted.reconcile()
++    held = restarted.get("buy-1")
++    assert summary == {"held": 1, "retried": 0, "filled": 0}
++    assert held["status"] == "awaiting_confirm" and held["note"] == "reconcile_hold"
++    assert held["attempts"] == 1
++    unfilled = restarted.observe("buy-1", signature_ok=True, token_delta=None, quote_delta=None, now=NOW)
++    assert unfilled["status"] == "confirmed_unfilled" and unfilled["provenance"] == "chain_unfilled"
++    restarted.close()
++
++
++def test_fill_needs_both_deltas_and_exit_follows_risk(tmp_path):
++    desk = ctx(tmp_path)
++    desk.db.x("INSERT INTO positions(mint,mode,opened_at) VALUES(?,?,?)", (MINT, "PAPER", NOW))
++    before = dump(desk.db)
++    led = book(tmp_path)
++    row = led.prepare(ticket(), **arm_ok())
++    led.conn.execute("UPDATE orders SET status='awaiting_confirm' WHERE intent_id=?", (row["intent_id"],))
++    filled = led.observe(row["intent_id"], signature_ok=True, token_delta=1_000_000,
++                         quote_delta=-30_000, now=NOW)
++    assert filled["status"] == "filled" and filled["provenance"] == "chain_delta"
++    pos = led.position(MINT)
++    assert pos["status"] == "open" and pos["qty"] == 1_000_000
++    # the desk book is a different file and stays as it was
++    assert dump(desk.db) == before
++    fired = led.plan_exit(MINT, 0.0, NOW, desk.cfg["risk"], ticket(intent_id="ignored"), **arm_ok())
++    assert fired["status"] == "built_unsigned" and fired["side"] == "sell"
++    assert bytes(fired["message"]).find(SELL_V3) > 0
++    with pytest.raises(SignerDisabled):
++        led.hand_off(fired["intent_id"])
++    # same exit is not built twice
++    assert led.plan_exit(MINT, 0.0, NOW, desk.cfg["risk"], ticket(intent_id="ignored"), **arm_ok())["intent_id"] == fired["intent_id"]
++    led.conn.execute("UPDATE orders SET status='awaiting_confirm' WHERE intent_id=?", (fired["intent_id"],))
++    closed = led.observe(fired["intent_id"], signature_ok=True, token_delta=-1_000_000,
++                         quote_delta=40_000, now=NOW + 1)
++    assert closed["status"] == "filled" and led.position(MINT)["status"] == "closed"
++    nxt = led.prepare(ticket(intent_id="buy-2"), **arm_ok())
++    assert nxt["status"] == "built_unsigned"
++    assert dump(desk.db) == before
++    led.close()
++
++
++def test_failed_exit_when_phase_is_unsupported(tmp_path):
++    desk = ctx(tmp_path)
++    led = book(tmp_path)
++    led.conn.execute(
++        "INSERT INTO live_positions(mint,buy_intent,qty,entry_price,size_usd,peak_price,stop_price,"
++        "trail_active,opened_at,status) VALUES(?,?,?,?,?,?,?,?,?,?)",
++        (MINT, "buy-1", 1_000_000, 1.0, 5.0, 1.0, None, 0, NOW, "open"))
++    failed = led.plan_exit(
++        MINT, 0.0, NOW, desk.cfg["risk"],
++        ticket(curve=curve(complete=True), pool=None), **arm_ok())
++    assert failed["status"] == "exit_failed" and failed["reason"] == "unsupported_phase"
++    assert led.position(MINT)["status"] == "exit_failed"
++    again = led.plan_exit(MINT, 0.0, NOW, desk.cfg["risk"], ticket(curve=curve(complete=True)), **arm_ok())
++    assert again["intent_id"] == failed["intent_id"]
++    led.close()
++
++
++def test_agent_reconciles_without_touching_network_or_desk(tmp_path):
++    desk = ctx(tmp_path)
++    desk.db.x("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)", ("scanner.min_liquidity_usd", "1000", NOW))
++    before = dump(desk.db)
++    side = Ledger(tmp_path / "pump_orders.db")
++    side.conn.execute(
++        "INSERT INTO orders(intent_id,mint,side,status,attempts,provenance,created_at,updated_at) "
++        "VALUES(?,?,?,?,?,?,?,?)",
++        ("held", MINT, "buy", "awaiting_confirm", 2, "unsigned", NOW, NOW))
++    side.close()
++    # the agent opens the sibling of the desk db; point the desk at that directory
++    desk.db.path = str(tmp_path / "desk.db")
++
++    class Boom:
++        def __getattr__(self, name):
++            raise AssertionError(name)
++
++    desk.sources = Boom()
++    agent = PumpLive(desk)
++
++    async def once(_):
++        raise asyncio.CancelledError
++
++    orig = asyncio.sleep
++    asyncio.sleep = once
++    try:
++        with pytest.raises(asyncio.CancelledError):
++            asyncio.run(agent.run())
++    finally:
++        asyncio.sleep = orig
++    held = Ledger(tmp_path / "pump_orders.db").get("held")
++    assert held["note"] == "reconcile_hold" and held["attempts"] == 2 and held["status"] == "awaiting_confirm"
++    assert dump(desk.db) == before
++
++
++def test_legacy_scanner_filters_and_settings_are_untouched():
++    text = (ROOT / "agents" / "scanner.py").read_text()
++    assert "subscribeMigration" in text and "PUMPPORTAL_WS" in text
++    assert "min_liquidity_usd" in text and "max_top10_pct" in text and "max_h1_change_pct" in text
++    assert set(DEFAULTS) == {"scanner", "auditor", "analyst", "executor", "risk", "desk"}
++    assert "pump" not in DEFAULTS["scanner"]
++
++
++def test_telegram_command_cannot_activate_and_cli_still_can_ask(tmp_path):
++    desk = ctx(tmp_path)
++    refused = asyncio.run(Commands(desk).handle("live"))[0].text
++    assert refused.startswith("Telegram cannot activate LIVE")
++    assert asyncio.run(Commands(desk).handle("LIVE"))[0].text.startswith("Telegram cannot activate LIVE")
++    assert asyncio.run(Commands(desk).handle("paper"))[0].text == "Already PAPER."
++    asked = asyncio.run(Commands(desk, who="cli").handle("live"))[0].text
++    assert "Type LIVE (capitals) within 2 min to confirm" in asked
++    assert desk.cfg["desk"]["mode"] == "PAPER"
++
++
++def test_telegram_cannot_arm_and_curve_watch_is_not_a_setting(tmp_path):
++    desk = ctx(tmp_path)
++    led = book(tmp_path)
++    row = led.prepare(ticket(), who="telegram", typed="LIVE", limits=limits(), night_done=True, reviewed=True)
++    assert row["status"] == "rejected" and "telegram" in row["reason"] and row["message"] is None
++    led.close()
++    reply = asyncio.run(Commands(desk).handle("set curve_watch on"))[0].text
++    assert reply.startswith("Unknown setting")
++    assert desk.cfg["desk"]["mode"] == "PAPER"
++
++
++def test_risk_helper_still_names_stop_before_timeout():
++    pos = {"entry_price": 1.0, "peak_price": 1.0, "stop_price": None, "trail_active": 0, "opened_at": NOW}
++    upd, reason = evaluate(pos, 0.9, NOW, desk_config()["risk"])
++    assert reason == "stop" and upd["stop_price"] == pytest.approx(0.94)
+--- a/PUMP_LIVE.md
++++ b/PUMP_LIVE.md
+@@ -0,0 +1,37 @@
++# Pump.fun execution, disabled
++
++This is construction against the sanitized desk source. It does not arm live trading, does not read a wallet, and does not send a transaction.
++
++## What is implemented
++
++- `pump_curve.py` builds official `buy_v3` / `sell_v3` instructions for program `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`, matching the public IDL and `@pump-fun/pump-sdk` 4.1.0. The quote is the bonding-curve formula with ceiling fees. Slippage is applied in basis points. The result is one legacy message containing that instruction. `partial_fill` is always off.
++- Older bonding-curve accounts are accepted by zero-padding up to 166 bytes. A longer account with unexpected bytes is refused. Discovery does not filter on a single data size, so older curves are not dropped.
++- `pump_exec.py` keeps orders in a separate `pump_orders.db`. It does not write the desk's coins, scans, positions, activity, balance, or settings. Statuses used: `rejected`, `built_unsigned`, `awaiting_confirm` (not written by this process), `confirmed_unfilled`, `filled`, `exit_failed`. The same intent is not built twice. A mint lock blocks a second buy. Three unfilled builds of one side stop further builds. Restart marks `awaiting_confirm` as held and does not retry or fill it. A fill requires a successful signature plus a token delta and a quote delta of the right signs.
++- Exits call the existing `agents.risk.evaluate` (stop, trail, timeout). A sell that cannot be built becomes `exit_failed` and the mint stays locked. A filled sell releases the lock.
++- `agents/pump_live.py` only reconciles that side file when it already exists, then sleeps. It does not heartbeat, so it does not appear as a sixth pipeline agent and health.py does not treat it as one. It does not call RPC.
++- Telegram `live` and `LIVE` are refused, including a stale confirmation prompt. Other commands are unchanged. The CLI manual FOMO switch still asks for typed `LIVE` and still does not arm this path or sign anything.
++- PumpSwap `buy_v2` / `sell_v2` for program `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` can be built only when the caller passes `pumpswap=True` for a migrated pool and supplies protocol, creator, and LP fee rates plus vault balances. The quote is constant product plus three ceiling fees. It is off otherwise.
++
++The arm check is separate from `desk.mode`. All of these have to be true at once: caller is not Telegram, the typed text is exactly `LIVE`, a paper night is done, a review flag is set, the kill switch is explicitly false, a 32-byte wallet is present, the network is `mainnet-beta` or `devnet`, and every numeric limit is present: position, exposure, max positions, daily loss, quote age, slippage, price impact, fee reserve, fee cap. This build does not store those values and does not treat code defaults as approval. Even when a test supplies them, `DisabledSigner.sign` raises and the row stays `built_unsigned`.
++
++## What is not implemented
++
++- No RPC client call, no `getProgramAccounts` send, no blockhash fetch, no fee-account decode, no balance read, no signature, no broadcast, no confirmation watcher.
++- The running agent never calls discovery or `prepare`. Curve rows are not published onto the scanner bus. `tradable` stays false. Legacy scanner filters and `DEFAULTS` are unchanged.
++- Fee tiers are not decoded from the fee program. The caller must pass the protocol and creator rates. If the curve's own creator rate is nonzero and disagrees with the passed rate, the quote is refused.
++- Cashback coins are refused (`buy_v3` / `sell_v3` do not support them). Mayhem, quote chains (`depth != 0`), non-SOL quotes, and a buy larger than the remaining curve supply are refused. There is no v2 curve fallback and no post-completion leg.
++- The message does not add associated-token creation or a compute-budget instruction. A later broadcaster would still need those, a real blockhash, and a listed buyback recipient from global config.
++- PumpSwap is not a guaranteed exit. Disable flags, empty or negative effective reserves, a missing fee rate, or the adapter flag being off all refuse.
++- No numeric curve filter (age, market cap, or a replacement for liquidity / top 10 / h1) was approved, so none was invented. Those pool filters still apply only to the existing migrated-pool scanner.
++- PumpPortal is not used as a new-token feed. The discovery body names that as unsupported and is not sent.
++- Help text and the Account page still say to type LIVE in Telegram. The command now refuses. Those sentences were left so the UI text does not change.
++
++## Tests
++
++`tests/test_pump_live.py`: 16 passed. They cover the curve quote and account layout, structural rejects, Token-2022, disabled discovery, the disabled PumpSwap adapter, the arm rules, unsigned build plus signer refusal, idempotency, the mint lock, the three-build cap, restart hold, delta rules, risk exits, failed exits, and Telegram refusal. They do not open a network socket.
++
++Full `pytest` in this tree: 131 passed, 62 failed, 7 errors, 2 skipped. 68 of the failures/errors are `FileNotFoundError` for `logs/raw` samples that were not in the sanitized archive (`rugcheck_report.json`, `rugcheck_insiders_graph_nonempty.json`, and the DexScreener samples those tests load through `tests/fakes.py`). Those fixtures were not invented. One pre-existing failure is `test_sw_never_caches_data_dir`: it expects cache name `desk-shell-v3-step13` while `web/sw.js` says `desk-shell-v4-homescreen`. The web files were not edited.
++
++## Still required before any live transaction
++
++A full PAPER night, a review of that night, user-approved numbers for every limit above, an approved wallet and network, and the user typing LIVE outside Telegram. A signer, RPC, fee-config decoding, and a decision about migrated-pool sends are still separate work. Nothing here restarts the desk or deploys it.
+--- a/.gitignore
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++__pycache__/
++.pytest_cache/
++*.pyc
++data/
++*.db
